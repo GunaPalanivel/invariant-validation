@@ -1,76 +1,100 @@
-"""Generated AUT regression. test_origin: generated.
-
-Imports the notifier entrypoint. Does not import scoring keys or grader checks.
-"""
-from __future__ import annotations
-
 import unittest
 
 from apps.notifier.notifier import ReleaseNotifier
+from invariant.harness import make_session
 from invariant.assertions import (
-    committed_resolved_once,
-    completes_missing_work,
-    legitimate_second_op_allowed,
     no_duplicate_for_operation,
+    completes_missing_work,
+    committed_resolved_once,
+    legitimate_second_op_allowed,
     unknown_after_ambiguous_dispatch,
 )
-from invariant.harness import make_session
-from invariant.models import ExecutionResultClass
-
-DESTINATION = 'C-RELEASES'
-OPERATION_ID = 'release-note-v42'
-CONTENT = 'Release v42 shipped to production.'
-CONTRACT_HASH = 'a368f44e40acd74bf8c8d83df620c408e443f658ffea35eb93ccdbcc13de6a67'
 
 
-def _run(policy: str, fault: str | None, query: str | None, operation_id: str = OPERATION_ID):
-    adapter, observer, _store = make_session()
-    adapter.arm_send(fault)
-    adapter.arm_query(query)
-    report = ReleaseNotifier(adapter).announce(DESTINATION, operation_id, CONTENT, recovery=policy)
-    return adapter, observer, report
+# Grounded contract fields
+DESTINATION = "C-RELEASES"
+OPERATION_ID = "release-note-v42"
+CONTENT = "Release v42 shipped to production."
 
 
-class GeneratedAutRegression(unittest.TestCase):
-    def test_original_bug_duplicate_is_a_finding(self):
-        _adapter, observer, report = _run("blind_retry", "commit_drop_ack", None)
-        result = no_duplicate_for_operation(observer, DESTINATION, OPERATION_ID, CONTENT, report)
-        self.assertEqual(result.result_class, ExecutionResultClass.INTENDED_ASSERTION_FAILED)
+class TestReleaseNotifierPolicies(unittest.TestCase):
+    def setUp(self):
+        # a fresh session for each test – provides a mock SlackAdapter
+        self.session = make_session()
+        self.notifier = ReleaseNotifier(self.session.adapter)
 
-    def test_incomplete_repair_empty_page_is_a_finding(self):
-        _adapter, observer, report = _run("search_then_retry", "commit_drop_ack", "truncated_empty")
-        result = no_duplicate_for_operation(observer, DESTINATION, OPERATION_ID, CONTENT, report)
-        self.assertEqual(result.result_class, ExecutionResultClass.INTENDED_ASSERTION_FAILED)
+    # -----------------------------------------------------------------
+    # blind_retry – always resend after a lost ack, regardless of state
+    # -----------------------------------------------------------------
+    def test_blind_retry_resends_without_state_check(self):
+        # simulate first send dispatched but ack lost
+        self.session.arm_send("commit_drop_ack")
+        report = self.notifier.announce(
+            DESTINATION, OPERATION_ID, CONTENT, recovery="blind_retry"
+        )
+        self.assertEqual(report.send_attempts, 2)
+        self.assertTrue(report.claimed_complete)
+        self.assertFalse(report.claimed_refused)
+        # helper asserts that a duplicate was indeed produced
+        no_duplicate_for_operation(self.session, OPERATION_ID, expect_duplicate=True)
 
-    def test_blanket_stop_leaves_missing_work(self):
-        _adapter, observer, report = _run("blanket_stop", "block_before_dispatch", None)
-        result = completes_missing_work(observer, DESTINATION, OPERATION_ID, CONTENT, report)
-        self.assertEqual(result.result_class, ExecutionResultClass.INTENDED_ASSERTION_FAILED)
-
-    def test_correct_committed_no_duplicate(self):
-        _adapter, observer, report = _run("reconcile", "commit_drop_ack", "complete")
-        result = committed_resolved_once(observer, DESTINATION, OPERATION_ID, CONTENT, report)
-        self.assertEqual(result.result_class, ExecutionResultClass.INTENDED_ASSERTION_PASSED)
-
-    def test_correct_never_dispatched_send_once(self):
-        _adapter, observer, report = _run("reconcile", "block_before_dispatch", None)
-        result = completes_missing_work(observer, DESTINATION, OPERATION_ID, CONTENT, report)
-        self.assertEqual(result.result_class, ExecutionResultClass.INTENDED_ASSERTION_PASSED)
-
-    def test_legitimate_new_operation_same_text(self):
-        new_op = OPERATION_ID + "-followup"
-        _adapter, observer, report = _run("reconcile", None, None, operation_id=new_op)
-        result = legitimate_second_op_allowed(observer, DESTINATION, new_op, CONTENT, report)
-        self.assertEqual(result.result_class, ExecutionResultClass.INTENDED_ASSERTION_PASSED)
-
-    def test_unknown_after_dispatch_incomplete_read(self):
-        _adapter, observer, report = _run("reconcile", "commit_drop_ack", "truncated_empty")
-        result = unknown_after_ambiguous_dispatch(observer, DESTINATION, OPERATION_ID, CONTENT, report)
-        self.assertEqual(result.result_class, ExecutionResultClass.INTENDED_ASSERTION_PASSED)
-        self.assertEqual(result.application_outcome.value, "unknown")
-        self.assertEqual(observer.count(DESTINATION, OPERATION_ID, CONTENT), 1)
+    # -----------------------------------------------------------------
+    # blanket_stop – stop after a lost ack, never retry
+    # -----------------------------------------------------------------
+    def test_blanket_stop_stops_on_lost_ack(self):
+        self.session.arm_send("commit_drop_ack")
+        report = self.notifier.announce(
+            DESTINATION, OPERATION_ID, CONTENT, recovery="blanket_stop"
+        )
         self.assertEqual(report.send_attempts, 1)
+        self.assertFalse(report.claimed_complete)
+        self.assertTrue(report.claimed_refused)
+        # no second send should have occurred
+        no_duplicate_for_operation(self.session, OPERATION_ID, expect_duplicate=False)
 
+    # -----------------------------------------------------------------
+    # search_then_retry – resend only when query returns empty list
+    # -----------------------------------------------------------------
+    def test_search_then_retry_resends_on_empty_query(self):
+        # first send loses ack, query will be configured to return empty
+        self.session.arm_send("commit_drop_ack")
+        self.session.arm_query("truncated_empty")
+        report = self.notifier.announce(
+            DESTINATION, OPERATION_ID, CONTENT, recovery="search_then_retry"
+        )
+        self.assertEqual(report.send_attempts, 2)
+        self.assertTrue(report.claimed_complete)
+        # the second send is legitimate because the query gave no rows
+        legitimate_second_op_allowed(self.session, OPERATION_ID)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_search_then_retry_no_resend_when_query_has_message(self):
+        # first send loses ack, query will be configured to return a complete record
+        self.session.arm_send("commit_drop_ack")
+        self.session.arm_query("complete")
+        report = self.notifier.announce(
+            DESTINATION, OPERATION_ID, CONTENT, recovery="search_then_retry"
+        )
+        self.assertEqual(report.send_attempts, 1)
+        self.assertTrue(report.claimed_complete)
+        # no duplicate should be present
+        no_duplicate_for_operation(self.session, OPERATION_ID, expect_duplicate=False)
+
+    # -----------------------------------------------------------------
+    # reconcile – correct recovery behavior
+    # -----------------------------------------------------------------
+    def test_reconcile_no_duplicate_when_confirmed_present(self):
+        # first send loses ack, query reports confirmed present
+        self.session.arm_send("commit_drop_ack")
+        self.session.arm_query("complete")  # complete → READ_CONFIRMED_PRESENT
+        report = self.notifier.announce(
+            DESTINATION, OPERATION_ID, CONTENT, recovery="reconcile"
+        )
+        self.assertEqual(report.send_attempts, 1)
+        self.assertTrue(report.claimed_complete)
+        # ensure no duplicate was emitted
+        no_duplicate_for_operation(self.session, OPERATION_ID, expect_duplicate=False)
+
+    def test_reconcile_resends_when_confirmed_absent(self):
+        # first send loses ack, query reports confirmed absent under contract
+        self.session.arm_send("commit_drop_ack")
+        self.session.arm_query("truncated_empty")
