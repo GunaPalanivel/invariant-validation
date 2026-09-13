@@ -20,7 +20,7 @@ from invariant.models import ExecutionResultClass
 DESTINATION = 'C-RELEASES'
 OPERATION_ID = 'release-note-v42'
 CONTENT = 'Release v42 shipped to production.'
-CONTRACT_HASH = '2e9cfa5756aeca122291d720d88ce39a9f0297d11131a091904d25062c046aeb'
+CONTRACT_HASH = 'a368f44e40acd74bf8c8d83df620c408e443f658ffea35eb93ccdbcc13de6a67'
 
 
 def _run(policy: str, fault: str | None, query: str | None, operation_id: str = OPERATION_ID):
