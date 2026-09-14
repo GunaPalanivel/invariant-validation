@@ -11,11 +11,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run AUT regressions and write execution manifest
+      - name: Run isolated candidate matrix
+        env:
+          PYTHONPATH: .
+        run: python scripts/run_candidate_matrix.py
+      - name: Run AUT regressions under correct overlay
         env:
           PYTHONPATH: .
           INVARIANT_AUT_IMPLEMENTATION: correct
-        run: python scripts/write_execution_manifest.py --run-tests
+        run: python -m unittest discover -s tests -v
       - uses: actions/upload-artifact@v4
         if: always()
         with:
